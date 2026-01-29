@@ -2,9 +2,9 @@ import logging
 import re
 
 import requests
-
 from api_app.analyzers_manager import classes
 from api_app.analyzers_manager.exceptions import AnalyzerRunException
+from tests.mock_utils import MockUpResponse, if_mock_connections, patch
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ IPv6_REG = (
     r"((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}"
     r"(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))\b"
 )
-EMAIL_REG = "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}"
+EMAIL_REG = "^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
 DOMAIN_REG = re.compile(
     r"^(?:[a-zA-Z0-9]"  # First character of the domain
     r"(?:[a-zA-Z0-9-_]{0,61}[A-Za-z0-9])?\.)"  # Sub domain + hostname
@@ -73,6 +73,9 @@ class IPQualityScore(classes.ObservableAnalyzer):
     IP_ENDPOINT = IPQS_BASE_URL + "ip?ip="
     EMAIL_ENDPOINT = IPQS_BASE_URL + "email?email="
     PHONE_ENDPOINT = IPQS_BASE_URL + "phone?phone="
+    USERNAME_ENDPOINT = IPQS_BASE_URL + "leaked/username?username="
+    PASSWORD_ENDPOINT = IPQS_BASE_URL + "leaked/password?password="
+    LEAKED_EMAILENDPOINT = IPQS_BASE_URL + "leaked/email?email="
 
     def _get_url_payload(self):
         return {
@@ -113,6 +116,12 @@ class IPQualityScore(classes.ObservableAnalyzer):
             "enhanced_name_check": str(self.enhanced_name_check).lower(),
         }
 
+    def _get_username_payload(self):
+        return {}
+
+    def _get_password_payload(self):
+        return {}
+
     def _get_calling_endpoint(self):
         if re.match(IP_REG, self.observable_name) or re.match(
             IPv6_REG, self.observable_name
@@ -123,18 +132,84 @@ class IPQualityScore(classes.ObservableAnalyzer):
         ):
             return self.URL_ENDPOINT, self._get_url_payload()
         elif re.match(EMAIL_REG, self.observable_name):
-            return self.EMAIL_ENDPOINT, self._get_email_payload()
+            return (
+                self.LEAKED_EMAILENDPOINT,
+                self.EMAIL_ENDPOINT,
+                self._get_email_payload(),
+            )
         elif re.match(PHONE_REG, self.observable_name):
             return self.PHONE_ENDPOINT, self._get_phone_payload()
         else:
-            return None, None
+            return (
+                self.USERNAME_ENDPOINT,
+                self._get_username_payload(),
+                self.PASSWORD_ENDPOINT,
+                self._get_password_payload(),
+            )
 
     def run(self):
-        calling_endpoint, payload = self._get_calling_endpoint()
+        endpoints = self._get_calling_endpoint()
         ipqs_headers = {"IPQS-KEY": self._ipqs_api_key}
 
         try:
-            if calling_endpoint and payload is not None:
+            if isinstance(endpoints, tuple) and len(endpoints) == 4:
+                (
+                    username_endpoint,
+                    username_payload,
+                    password_endpoint,
+                    password_payload,
+                ) = endpoints
+
+                response_username = requests.get(
+                    username_endpoint + self.observable_name,
+                    headers=ipqs_headers,
+                    params=username_payload,
+                )
+                response_username.raise_for_status()
+                result_username = response_username.json()
+
+                response_password = requests.get(
+                    password_endpoint + self.observable_name,
+                    headers=ipqs_headers,
+                    params=password_payload,
+                )
+                response_password.raise_for_status()
+                result_password = response_password.json()
+
+                combined_result = {
+                    "darkweb_leak_username_api_result": result_username,
+                    "darkweb_leak_password_api_result": result_password,
+                }
+                return combined_result
+
+            # Email case: _get_calling_endpoint returns (leaked_endpoint, email_endpoint, email_payload)
+            elif isinstance(endpoints, tuple) and len(endpoints) == 3:
+                leaked_email_endpoint, email_endpoint, email_payload = endpoints
+
+                response_leaked = requests.get(
+                    leaked_email_endpoint + self.observable_name,
+                    headers=ipqs_headers,
+                )
+                response_leaked.raise_for_status()
+                result_leaked = response_leaked.json()
+
+                response_email = requests.get(
+                    email_endpoint + self.observable_name,
+                    headers=ipqs_headers,
+                    params=email_payload,
+                )
+                response_email.raise_for_status()
+                result_email = response_email.json()
+
+                combined_result = {
+                    "darkweb_leak_email_api_result": result_leaked,
+                    "email_reputation_api_result": result_email,
+                }
+                return combined_result
+
+            # Normal case: endpoints is (endpoint, payload)
+            elif isinstance(endpoints, tuple) and len(endpoints) == 2:
+                calling_endpoint, payload = endpoints
                 response = requests.get(
                     calling_endpoint + self.observable_name,
                     headers=ipqs_headers,
@@ -148,3 +223,46 @@ class IPQualityScore(classes.ObservableAnalyzer):
                 raise AnalyzerRunException("Invalid or unsupported observable type")
         except requests.RequestException as e:
             raise AnalyzerRunException(e)
+
+    @classmethod
+    def _monkeypatch(cls):
+        sample_response = {
+            "message": "Success.",
+            "success": True,
+            "unsafe": False,
+            "domain": "test.com",
+            "ip_address": "0.0.0.0",
+            "server": "gws",
+            "content_type": "text/html; charset=UTF-8",
+            "status_code": 200,
+            "page_size": 82252,
+            "domain_rank": 1,
+            "dns_valid": True,
+            "parking": False,
+            "spamming": False,
+            "malware": False,
+            "phishing": False,
+            "suspicious": False,
+            "adult": False,
+            "risk_score": 0,
+            "country_code": "US",
+            "category": "Search Engines",
+            "domain_age": {
+                "human": "26 years ago",
+                "timestamp": 874296000,
+                "iso": "1997-09-15T00:00:00-04:00",
+            },
+            "redirected": False,
+            "language_code": "N/A",
+            "final_url": "http://test.com",
+            "request_id": "KWc8M5Dvep",
+        }
+        patches = [
+            if_mock_connections(
+                patch(
+                    "requests.get",
+                    return_value=MockUpResponse(sample_response, 200),
+                ),
+            )
+        ]
+        return super()._monkeypatch(patches=patches)
